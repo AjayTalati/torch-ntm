@@ -33,6 +33,13 @@ For the copy task:
 th tasks/copy.lua
 ```
 
+To train a NTM model for the copy task, and then demo it:
+
+```
+th tasks/copy_v2.lua
+th tasks/copy_pretrined.lua
+```
+
 For the associative recall task:
 
 ```
