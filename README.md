@@ -45,3 +45,9 @@ For the associative recall task:
 ```
 th tasks/recall.lua
 ```
+
+## To do
+
+1. Document the code more, especially the single read and write case for `ntm_v2.lua`
+2. Recreate figures 6 and 4 from the paper
+3. Try to implement a feedforward version of the controller
