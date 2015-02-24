@@ -1,0 +1,681 @@
+--[[ This is a heavily commented version of NTM.lua
+
+  References,
+
+  [1] - Neural Turing Machine- http://arxiv.org/pdf/1410.5401v2.pdf
+
+  [2] - Generating Sequences With Recurrent Neural Networks - Alex Graves
+
+  [3] - Banishing the Homunculus: making working memory work - http://ski.clps.brown.edu/papers/HazyFrankOReilly06.pdf
+
+  Variable names take after the notation in the paper. Identifiers with "r"
+  appended indicate read-head variables, and likewise for those with "w" appended.
+
+  The NTM take a configuration table at initialization time with the following
+  options:
+
+  * input_dim   dimension of input vectors (required)
+  * output_dim  dimension of output vectors (required)
+  * mem_rows    number of rows of the memory matrix, denoted as N 
+  * mem_cols    number of columns of the memory matrix, denoted as M
+  * cont_dim    dimension of controller state
+  * cont_layers number of controller layers
+  * shift_range allowed range for shifting read/write weights
+  * write_heads number of write heads
+  * read_heads  number of read heads
+
+--]]
+
+--[[ Creates a class ntm.NTM which inherits methods from nn.module
+
+See https://github.com/torch/torch7/blob/master/doc/utility.md#torch.class
+
+--]]
+
+local NTM, parent = torch.class('ntm.NTM', 'nn.Module')
+
+--[[ NTM:__init(config)
+
+USE - This function is called by tasks to initialize the NTM class
+
+DEPENDENCIES
+- new_cell()
+- new_init_module()
+- init_grad_inputs()
+
+ARGS
+- config : the configuration table - see [1], page 6
+
+NOTES - in the single read/write head cases, this can be simplified 
+
+--]]
+
+function NTM:__init(config)
+  self.input_dim   = config.input_dim   or error('config.input_dim must be specified')
+  self.output_dim  = config.output_dim  or error('config.output_dim must be specified')
+  self.mem_rows    = config.mem_rows    or 128
+  self.mem_cols    = config.mem_cols    or 20
+  self.cont_dim    = config.cont_dim    or 100
+  self.cont_layers = config.cont_layers or 1
+  self.shift_range = config.shift_range or 1
+  self.write_heads = config.write_heads or 1
+  self.read_heads  = config.read_heads  or 1
+
+  self.depth = 0
+  self.cells = {}
+  self.master_cell = self:new_cell()
+  self.init_module = self:new_init_module()
+
+  self:init_grad_inputs()
+  local cell_params, _ = self.master_cell:parameters()
+end
+
+--[[ NTM:init_grad_inputs
+
+PURPOSE - Changes the global variable self.gradInput
+
+USE - This function is called by NTM:__init
+
+DEPENDENCIES - none
+
+ARGS - none
+
+RETURNS - none
+
+INTERNAL VARIABLES
+
+- wr : length M vector of weightings emitted by a read head at time t, see [1] p6 3.1
+- ww : length M vector of weightings emitted by a read head at time t, see [1] p6 3.2
+- r  : length M read vector 
+
+--]]
+
+function NTM:init_grad_inputs()
+  local ww_gradInput
+  if self.write_heads == 1 then
+    ww_gradInput = torch.zeros(self.mem_rows)
+  else
+    ww_gradInput = {}
+    for i = 1, self.write_heads do
+      ww_gradInput[i] = torch.zeros(self.mem_rows)
+    end
+  end
+
+  local wr_gradInput, r_gradInput
+  if self.read_heads == 1 then
+    wr_gradInput = torch.zeros(self.mem_rows)
+    r_gradInput = torch.zeros(self.mem_cols)
+  else
+    wr_gradInput, r_gradInput = {}, {}
+    for i = 1, self.read_heads do
+      wr_gradInput[i] = torch.zeros(self.mem_rows) 
+      r_gradInput[i] = torch.zeros(self.mem_cols)
+    end
+  end
+
+  local m_gradInput, c_gradInput
+  if self.cont_layers == 1 then
+    m_gradInput = torch.zeros(self.cont_dim)
+    c_gradInput = torch.zeros(self.cont_dim)
+  else
+    m_gradInput, c_gradInput = {}, {}
+    for i = 1, self.cont_layers do
+      m_gradInput[i] = torch.zeros(self.cont_dim)
+      c_gradInput[i] = torch.zeros(self.cont_dim)
+    end
+  end
+
+  self.gradInput = {
+    torch.zeros(self.input_dim), -- input
+    torch.zeros(self.mem_rows, self.mem_cols), -- M
+    wr_gradInput,
+    ww_gradInput,
+    r_gradInput,
+    m_gradInput,
+    c_gradInput
+  }
+end
+
+--[[ NTM:new_init_module()
+
+PURPOSE - The initialization module initializes the state of NTM memory, read/write weights, and the state of the LSTM controller.
+
+INTERNAL VARIABLES - most of the local variables in this function are created to be used as the second argument in nn.gModule
+
+DEPENDENCIES
+
+-nn.gModule :  this is defined in the nngraph module
+
+--]]
+
+function NTM:new_init_module()
+  local dummy = nn.Identity()() -- always zero
+  local output_init = nn.Tanh()(nn.Linear(1, self.output_dim)(dummy))
+
+  -- memory
+  local M_init_lin = nn.Linear(1, self.mem_rows * self.mem_cols)
+  local M_init = nn.View(self.mem_rows, self.mem_cols)(
+    nn.Tanh()(M_init_lin(dummy)))
+
+  -- read weights
+  local wr_init, r_init = {}, {}
+  for i = 1, self.read_heads do
+    local wr_init_lin = nn.Linear(1, self.mem_rows)
+    wr_init[i] = nn.SoftMax()(wr_init_lin(dummy))
+    r_init[i] = nn.Tanh()(nn.Linear(1, self.mem_cols)(dummy))
+
+    -- We initialize the read and write distributions such that the
+    -- weights decay exponentially over the rows of NTM memory.
+    -- This sort of initialization seems to be important in my experiments (kst).
+    wr_init_lin.bias:copy(torch.range(self.mem_rows, 1, -1))
+  end
+  
+  -- write weights
+  local ww_init = {}
+  for i = 1, self.write_heads do
+    local ww_init_lin = nn.Linear(1, self.mem_rows)
+    ww_init[i] = nn.SoftMax()(ww_init_lin(dummy))
+
+    -- See initialization comment above
+    ww_init_lin.bias:copy(torch.range(self.mem_rows, 1, -1))
+  end
+  
+  -- controller state
+  local m_init, c_init = {}, {}
+  for i = 1, self.cont_layers do
+    m_init[i] = nn.Tanh()(nn.Linear(1, self.cont_dim)(dummy))
+    c_init[i] = nn.Tanh()(nn.Linear(1, self.cont_dim)(dummy))
+  end
+
+  -- wrap tables as nngraph nodes
+  ww_init = nn.Identity()(ww_init)
+  wr_init = nn.Identity()(wr_init)
+  r_init = nn.Identity()(r_init)
+  m_init = nn.Identity()(m_init)
+  c_init = nn.Identity()(c_init)
+
+  local inits = {
+    output_init, M_init, wr_init, ww_init, r_init, m_init, c_init
+  }
+  return nn.gModule({dummy}, inits)
+end
+
+--[[ NTM:new_cell()
+
+PURPOSE - Create a new NTM cell. Each cell shares the parameters of the "master" cell and stores the outputs of each iteration of forward propagation. A NTM cell is similar to an LTSM cell but with read and write connects)
+
+USED IN
+
+- NTM:__init
+- NTM:forward
+
+DEPENDENCIES
+
+- NTM:new_controller_module
+- NTM:new_mem_module
+- NTM:new_output_module
+- nn.gModule, see nngraph
+- share_params : this is defined in init.lua 
+
+ARGS - none
+
+RETURNS 
+
+- cell : an object of class nngraph ???
+
+READING
+
+A standard single LSTM memory cell is illustrated in Fig 2, in [2] page 5. 
+
+
+--]]
+
+function NTM:new_cell()
+  -- input to the network
+  local input = nn.Identity()()
+
+  -- previous memory state and read/write weights
+  local M_p = nn.Identity()()
+  local wr_p = nn.Identity()()
+  local ww_p = nn.Identity()()
+
+  -- vector read from memory
+  local r_p = nn.Identity()()
+
+  -- LSTM controller output
+  local mtable_p = nn.Identity()()
+  local ctable_p = nn.Identity()()
+
+  -- output and hidden states of the controller module
+  local mtable, ctable = self:new_controller_module(input, r_p, mtable_p, ctable_p)
+  local m = (self.cont_layers == 1) and mtable 
+    or nn.SelectTable(self.cont_layers)(mtable)
+  local M, wr, ww, r = self:new_mem_module(M_p, wr_p, ww_p, m)
+  local output = self:new_output_module(m)
+
+  local inputs = {input, M_p, wr_p, ww_p, r_p, mtable_p, ctable_p}
+  local outputs = {output, M, wr, ww, r, mtable, ctable}
+
+  local cell = nn.gModule(inputs, outputs)
+  if self.master_cell ~= nil then
+    share_params(cell, self.master_cell, 'weight', 'bias', 'gradWeight', 'gradBias')
+  end
+  return cell
+end
+
+--[[ NTM:new_controller_module
+
+PURPOSE - Create a new LSTM controller neural network defined as a memory table and controller table pair.  
+
+USE - This function is called by NTM:new_cell
+
+DEPENDENCIES 
+
+- nn : mainly layer construction methods in the 
+
+ARGS
+
+- input : the external input
+- r_p : the previous read vector ????
+- mtable_p : the previous memory table ????
+- ctable_p : the previous control state table ????
+
+RETURNS
+
+- mtable
+- ctable
+
+READING 
+
+Figure 1, page 5
+
+--]]
+
+function NTM:new_controller_module(input, r_p, mtable_p, ctable_p)
+  -- multilayer LSTM
+  local mtable, ctable = {}, {}
+  for layer = 1, self.cont_layers do
+    local new_gate, m_p, c_p
+    if self.cont_layers == 1 then
+      m_p = mtable_p
+      c_p = ctable_p
+    else
+      m_p = nn.SelectTable(layer)(mtable_p)
+      c_p = nn.SelectTable(layer)(ctable_p)
+    end
+
+    if layer == 1 then
+      new_gate = function()
+        local in_modules = {
+          nn.Linear(self.input_dim, self.cont_dim)(input),
+          nn.Linear(self.cont_dim, self.cont_dim)(m_p)
+        }
+        if self.read_heads == 1 then
+          table.insert(in_modules, nn.Linear(self.mem_cols, self.cont_dim)(r_p))
+        else
+          for i = 1, self.read_heads do
+            local vec = nn.SelectTable(i)(r_p)
+            table.insert(in_modules, nn.Linear(self.mem_cols, self.cont_dim)(vec))
+          end
+        end
+        return nn.CAddTable()(in_modules)
+      end
+    else
+      new_gate = function()
+        return nn.CAddTable(){
+          nn.Linear(self.cont_dim, self.cont_dim)(mtable[layer - 1]),
+          nn.Linear(self.cont_dim, self.cont_dim)(m_p)
+        }
+      end
+    end
+
+    -- input, forget, and output gates
+    local i = nn.Sigmoid()(new_gate())
+    local f = nn.Sigmoid()(new_gate())
+    local o = nn.Sigmoid()(new_gate())
+    local update = nn.Tanh()(new_gate())
+
+    -- update the state of the LSTM cell
+    ctable[layer] = nn.CAddTable(){
+      nn.CMulTable(){f, c_p},
+      nn.CMulTable(){i, update}
+    }
+
+    mtable[layer] = nn.CMulTable(){o, nn.Tanh()(ctable[layer])}
+  end
+
+  mtable = nn.Identity()(mtable)
+  ctable = nn.Identity()(ctable)
+  return mtable, ctable
+end
+
+--[[ NTM:new_mem_module
+
+PURPOSE - Create a new module to read/write to memory
+
+--]]
+
+function NTM:new_mem_module(M_p, wr_p, ww_p, m)
+  -- read heads
+  local wr, r
+  if self.read_heads == 1 then
+    wr, r = self:new_read_head(M_p, wr_p, m)
+  else
+    wr, r = {}, {}
+    for i = 1, self.read_heads do
+      local prev_weights = nn.SelectTable(i)(wr_p)
+      wr[i], r[i] = self:new_read_head(M_p, prev_weights, m)
+    end
+    wr = nn.Identity()(wr)
+    r = nn.Identity()(r)
+  end
+
+  -- write heads
+  local ww, a, e, M_erase, M_write
+  if self.write_heads == 1 then
+    ww, a, e = self:new_write_head(M_p, ww_p, m)
+    M_erase = nn.AddConstant(1)(nn.MulConstant(-1)(nn.OuterProd(){ww, e}))
+    M_write = nn.OuterProd(){ww, a}
+  else
+    ww, a, e, M_erase, M_write = {}, {}, {}, {}, {}
+    for i = 1, self.write_heads do
+      local prev_weights = nn.SelectTable(i)(ww_p)
+      ww[i], a[i], e[i] = self:new_write_head(M_p, prev_weights, m)
+      M_erase[i] = nn.AddConstant(1)(nn.MulConstant(-1)(nn.OuterProd(){ww[i], e[i]}))
+      M_write[i] = nn.OuterProd(){ww[i], a[i]}
+    end
+    M_erase = nn.CMulTable()(M_erase)
+    M_write = nn.CAddTable()(M_write)
+    ww = nn.Identity()(ww)
+  end
+
+  -- erase some history from memory
+  local Mtilde = nn.CMulTable(){M_p, M_erase}
+
+  -- write to memory
+  local M = nn.CAddTable(){Mtilde, M_write}
+
+  return M, wr, ww, r
+end
+
+--[[ NTM:new_read_head
+
+--]]
+
+function NTM:new_read_head(M_p, w_p, m)
+  return self:new_head(M_p, w_p, m, true)
+end
+
+--[[ NTM:new_write_head
+
+--]]
+
+function NTM:new_write_head(M_p, w_p, m)
+  return self:new_head(M_p, w_p, m, false)
+end
+
+--[[ NTM:new_head
+
+PURPOSE - Create a new head - see sec 3.3 
+
+USE
+- NTM:new_write_head
+- NTM:new_read_head
+
+READING -   
+
+We achieved this by defining ‘blurry’ read and write operations that interact to a greater or lesser degree with all the elements in memory (rather
+than addressing a single element, as in a normal Turing machine or digital computer). The degree of blurriness is determined by an attentional “focus” mechanism that constrains each read and write operation to interact with a small portion of the memory, while ignoring the rest ... The memory location brought into attentional focus is determined by specialised outputs emitted by the heads. These outputs define a normalised weighting over the rows in the memory matrix (referred to as memory “locations”). Each weighting, one per read or write head, defines the degree to which the head reads or writes at each location. A head can thereby attend sharply to the memory at a single location or weakly to the memory at many locations. [1]p5
+
+Although we have now shown the equations of reading and writing, we have not described how the weightings are produced. These weightings arise by combining two addressing
+mechanisms with complementary facilities. [1]p7
+
+--]]
+
+function NTM:new_head(M_p, w_p, m, is_read)
+  
+  -- key vector
+  local k     = nn.Tanh()(nn.Linear(self.cont_dim, self.mem_cols)(m))
+  -- circular convolution kernel
+  local s     = nn.SoftMax()(nn.Linear(self.cont_dim, 2 * self.shift_range + 1)(m))
+  -- weight sharpening parameter
+  local beta  = nn.SoftPlus()(nn.Linear(self.cont_dim, 1)(m))
+  -- interpolation gating parameter
+  local g     = nn.Sigmoid()(nn.Linear(self.cont_dim, 1)(m))
+  
+  -- exponential focusing parameter, see eqn 9, page 9
+  local gamma = nn.AddConstant(1)(
+    nn.SoftPlus()(nn.Linear(self.cont_dim, 1)(m)))
+  
+  local sim = nn.SmoothCosineSimilarity(){M_p, k}
+  
+  -- see eqn 5 page 8
+  local wc = nn.SoftMax()(nn.ScalarMulTable(){sim, beta})
+  
+  -- see eqn 7 page 8
+  local wg = nn.CAddTable(){
+    nn.ScalarMulTable(){wc, g},
+    nn.ScalarMulTable(){w_p, nn.AddConstant(1)(nn.MulConstant(-1)(g))}
+  }
+
+  -- see eqn 8 page 9
+  local wtilde = nn.CircularConvolution(){wg, s}
+
+  -- see eqn 9 page 9
+  local wpow = nn.PowTable(){wtilde, gamma}
+  local w = nn.Normalize()(wpow)
+  
+  if is_read then
+    local r = nn.MixtureTable(){w, M_p}
+    return w, r
+  else
+    local a = nn.Tanh()(nn.Linear(self.cont_dim, self.mem_cols)(m))
+    local e = nn.Sigmoid()(nn.Linear(self.cont_dim, self.mem_cols)(m))
+    return w, a, e
+  end
+end
+
+--[[ NTM:new_output_module
+
+PURPOSE - Create an output module, e.g. to output binary strings.
+
+READING
+
+See - Figure 1 page 5
+
+--]]
+
+function NTM:new_output_module(m)
+  local output = nn.Sigmoid()(nn.Linear(self.cont_dim, self.output_dim)(m))
+  return output
+end
+
+--[[ NTM:forward
+
+USEAGE - This function is called by the forward functions in the tasks, Copy and Associative Recall
+
+PURPOSE - Forward propagate one time step. The outputs of previous time steps are cached for backpropagation.
+
+DEPENDENCIES 
+
+- ntm.new_cell
+- nn.forward : self.init_module is an object of class nn
+
+--]]
+
+function NTM:forward(input)
+  self.depth = self.depth + 1
+  local cell = self.cells[self.depth]
+  if cell == nil then
+    cell = self:new_cell()
+    self.cells[self.depth] = cell
+  end
+  
+  local prev_outputs
+  if self.depth == 1 then
+    prev_outputs = self.init_module:forward(torch.Tensor{0})
+  else
+    prev_outputs = self.cells[self.depth - 1].output
+  end
+
+  -- get inputs
+  local inputs = {input}
+  for i = 2, #prev_outputs do
+    inputs[i] = prev_outputs[i]
+  end
+  local outputs = cell:forward(inputs)
+  self.output = outputs[1]
+  return self.output
+end
+
+--[[ NTM:backward
+
+PURPOSE - Backward propagate one time step. Throws an error if called more times than forward has been called.
+
+USEAGE - This function is called by tasks
+
+DEPENDENCIES 
+- nn.forward
+
+OUTPUTS
+ 
+--]]
+
+function NTM:backward(input, grad_output)
+  if self.depth == 0 then
+    error("No cells to backpropagate through")
+  end
+  local cell = self.cells[self.depth]
+  local grad_outputs = {grad_output}
+  for i = 2, #self.gradInput do
+    grad_outputs[i] = self.gradInput[i]
+  end
+
+  -- get inputs
+  local prev_outputs
+  if self.depth == 1 then
+    prev_outputs = self.init_module:forward(torch.Tensor{0})
+  else
+    prev_outputs = self.cells[self.depth - 1].output
+  end
+  local inputs = {input}
+  for i = 2, #prev_outputs do
+    inputs[i] = prev_outputs[i]
+  end
+
+  self.gradInput = cell:backward(inputs, grad_outputs)
+  self.depth = self.depth - 1
+  if self.depth == 0 then
+    self.init_module:backward(torch.Tensor{0}, self.gradInput)
+    for i = 1, #self.gradInput do
+      local gradInput = self.gradInput[i]
+      if type(gradInput) == 'table' then
+        for _, t in pairs(gradInput) do t:zero() end
+      else
+        self.gradInput[i]:zero()
+      end
+    end
+  end
+  return self.gradInput
+end
+
+--[[ NTM:get_memory
+
+PURPOSE - Get the state of memory
+
+USEAGE - Does not seem to be used at the moment, could be used to create figure 6 from the paper
+
+--]]
+
+function NTM:get_memory(depth)
+  if self.depth == 0 then
+    return self.initial_values[2]
+  end
+  local depth = depth or self.depth
+  return self.cells[self.depth].output[2]
+end
+
+--[[ NTM:get_read_weights
+
+PURPOSE - Get read head weights over the rows of memory
+
+USEAGE - used in the function print_read_max in file tasks/util.lua to print out the read heads with the largest weights 
+
+--]]
+
+function NTM:get_read_weights(depth)
+  if self.depth == 0 then
+    return self.initial_values[3]
+  end
+  local depth = depth or self.depth
+  return self.cells[depth].output[3]
+end
+
+--[[ NTM:get_write_weights
+
+PURPOSE - Get write head weights over the rows of memory
+
+USEAGE - used in the function print_write_max in file tasks/util.lua to print out the write heads with the largest weights 
+
+--]]
+
+function NTM:get_write_weights(depth)
+  if self.depth == 0 then
+    return self.initial_values[4]
+  end
+  local depth = depth or self.depth
+  return self.cells[depth].output[4]
+end
+
+--[[ NTM:get_read_vector
+
+PURPOSE - Get the vector read from memory
+
+--]]
+
+function NTM:get_read_vector(depth)
+  if self.depth == 0 then
+    return self.initial_values[5]
+  end
+  local depth = depth or self.depth
+  return self.cells[depth].output[5]
+end
+
+--[[ NTM:parameters
+
+PURPOSE - ??? Get the LSTM network parameters (weights)
+
+--]]
+
+function NTM:parameters()
+  local p, g = self.master_cell:parameters()
+  local pi, gi = self.init_module:parameters()
+  tablex.insertvalues(p, pi)
+  tablex.insertvalues(g, gi)
+  return p, g
+end
+
+--[[ NTM:forget
+
+PURPOSE - ??? 
+
+--]]
+
+function NTM:forget()
+  self.depth = 0
+  self:zeroGradParameters()
+  for i = 1, #self.gradInput do
+    self.gradInput[i]:zero()
+  end
+end
+
+--[[ NTM:zeroGradParameters
+
+PURPOSE - ??? 
+
+--]]
+
+function NTM:zeroGradParameters()
+  self.master_cell:zeroGradParameters()
+  self.init_module:zeroGradParameters()
+end
