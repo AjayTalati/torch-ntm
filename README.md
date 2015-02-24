@@ -49,5 +49,5 @@ th tasks/recall.lua
 ## To do
 
 1. Document the code more, especially the single read and write case for `ntm_v2.lua`
-2. Recreate figures 6 and 4 from the paper
-3. Try to implement a feedforward version of the controller
+2. Recreate figures 15, 6 and 4 from the paper
+3. Try to implement the recurrent variational auto encoder from [DRAW: A Recurrent Neural Network for Image Generation](http://arxiv-web3.library.cornell.edu/pdf/1502.04623v1.pdf). In particular, try to recreate the DRAW without attention score of 87.40 in Table 2 of that paper. Then try to recreate figure 7.
