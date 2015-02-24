@@ -27,7 +27,7 @@ local max_len = 20
 function generate_sequence(len, bits)
   local seq = torch.zeros(len, bits + 2)
   for i = 1, len do
-    seq[{i, {3, bits + 2}}] = torch.rand(bits):round()
+    seq[{i, {3, bits + 2}}] = torch.rand(bits):round() -- cols 1 & 2 are reserved for the start & end symbols
   end
   return seq
 end
