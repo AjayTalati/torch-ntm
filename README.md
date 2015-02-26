@@ -50,4 +50,7 @@ th tasks/recall.lua
 
 1. Document the code more, especially the single read and write case for `ntm_v2.lua`
 2. Recreate figures 15, 6 and 4 from the paper
-3. Try to implement the recurrent variational auto encoder from [DRAW: A Recurrent Neural Network for Image Generation](http://arxiv-web3.library.cornell.edu/pdf/1502.04623v1.pdf). In particular, try to recreate the DRAW without attention score of 87.40 in Table 2 of that paper. Then try to recreate figure 7.
+3. Implement the ff controller version, and the plain LSTM model
+4. Implement the dynamic N-Grams task section 4.4
+5. Experiment with using the Adam optimizer
+6. Try to implement the recurrent variational auto encoder from [DRAW: A Recurrent Neural Network for Image Generation](http://arxiv-web3.library.cornell.edu/pdf/1502.04623v1.pdf).
