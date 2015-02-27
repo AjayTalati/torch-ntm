@@ -33,8 +33,24 @@ For the copy task:
 th tasks/copy.lua
 ```
 
+To train a NTM model for the copy task, and then demo it:
+
+```
+th tasks/copy_v2.lua
+th tasks/copy_pretrined.lua
+```
+
 For the associative recall task:
 
 ```
 th tasks/recall.lua
 ```
+
+## To do
+
+1. Document the code more, especially the single read and write case for `ntm_v2.lua`
+2. Recreate figures 15, 6 and 4 from the paper
+3. Implement the ff controller version, and the plain LSTM model
+4. Implement the dynamic N-Grams task section 4.4
+5. Experiment with using the Adam optimizer
+6. Try to implement the recurrent variational auto encoder from [DRAW: A Recurrent Neural Network for Image Generation](http://arxiv-web3.library.cornell.edu/pdf/1502.04623v1.pdf).
